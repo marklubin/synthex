@@ -1,80 +1,78 @@
 # Synthex
 
-**Neural schematic primitives for agent memory**
+**Memory architectures that evolve with your agent**
 
-Synthex is a declarative framework for building custom cognitive architectures. Define your memory processing pipeline in TOML, compose transformations with LLM prompts, and query with full provenance.
+Synthex is a memory workbench for building custom cognitive architectures. Define processing pipelines in Python, experiment with branches, measure with benchmarks, and evolve without losing data.
+
+## The Problem
+
+Current agent memory solutions are either too simple (Mem0: add/search) or too opinionated (Letta: fixed hierarchy). Nobody knows what the right memory architecture is for your domain — including you.
+
+Synthex lets you find out.
+
+## Quick Start
+
+```bash
+# Import and process in one command
+synthex init personal-memory --from ~/exports/chatgpt.json
+synthex run
+synthex search "that rust conversation"
+```
+
+## Python API
+
+```python
+from synthex import Pipeline
+
+pipeline = Pipeline("personal-memory", agent="mark")
+
+# Sources
+pipeline.source("chatgpt", file="~/exports/chatgpt.json", format="chatgpt-export")
+
+# Processing
+pipeline.transform("summaries", from_="chatgpt", prompt=summarize)
+pipeline.aggregate("monthly", from_="summaries", period="month", prompt=reflect)
+pipeline.fold("world-model", from_="monthly", prompt=world_model)
+
+# Outputs
+pipeline.output("context", from_="world-model", surface="projection")
+pipeline.output("search", from_=["summaries", "monthly"], surface="search")
+
+# Run
+pipeline.run()
+
+# Experiment
+branch = pipeline.branch("better-summaries")
+branch.transform("summaries", from_="chatgpt", prompt=improved_summarize)
+branch.run(full=True)
+
+# Compare
+if branch.eval("locomo") > pipeline.eval("locomo"):
+    branch.promote()
+```
+
+## Key Features
+
+- **Python-first** — Define pipelines in code, not config
+- **Full provenance** — Trace any memory back to its source
+- **Branching** — Experiment with different architectures in isolation
+- **Incremental** — Only process new data on re-runs
+- **Evolvable** — Change architecture without losing source data
+- **Measurable** — Built-in benchmarks (LoCoMo, LongMemEval)
 
 ## Why Synthex?
 
-Current agent memory solutions are either too simple (Mem0: add/search) or too opinionated (Letta: fixed hierarchy). Synthex gives you primitives to build any architecture:
+The killer feature: **architecture migration without data loss**.
 
-- **Declarative configuration** - Define memory pipelines in TOML, like Terraform for cognition
-- **Full provenance** - Trace any memory back to its source
-- **Incremental processing** - Only process new data on re-runs
-- **Branching** - Experiment with different prompts/architectures
-- **Bulk import** - Process years of conversation history
-
-## Quick Example
-
-```toml
-# synthex.toml
-[project]
-name = "personal-memory"
-agent = "mark"
-
-[sources.chatgpt]
-type = "file"
-format = "chatgpt-export"
-path = "~/exports/chatgpt.json"
-
-[steps.summaries]
-type = "transform"
-from = ["chatgpt"]
-prompt = "summarize-conversation"
-
-[steps.monthly]
-type = "aggregate"
-from = ["summaries"]
-period = "month"
-prompt = "monthly-reflection"
-
-[steps.world-model]
-type = "fold"
-from = ["monthly"]
-prompt = "world-model"
-
-[outputs.context]
-from = ["world-model"]
-surface = "agent-context"
-```
-
-```bash
-synthex init personal-memory
-synthex run --all
-synthex search "python projects"
-synthex lineage <record-id>
-```
-
-## Installation
-
-```bash
-pip install synthex  # coming soon
-```
+If your current memory system isn't working, you normally have to start over. Synthex lets you change the processing pipeline while keeping all source data. The data doesn't move — the lens changes.
 
 ## Documentation
 
-See [DESIGN.md](./DESIGN.md) for the full design document including:
-
-- Vision and motivation
-- Domain model and concepts
-- Configuration reference
-- CLI commands
-- Implementation roadmap
-- Evaluation strategy
+See [DESIGN.md](./DESIGN.md) for the full design document.
 
 ## Status
 
-🚧 **Early Development** - Architecture and design phase. Not yet functional.
+🚧 **Early Development** — Design phase complete. Implementation in progress.
 
 ## License
 
