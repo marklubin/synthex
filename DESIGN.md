@@ -6,6 +6,20 @@
 
 ## Part I: Vision
 
+### 1.0 Origin Story
+
+I was trying to build memory for Kairix, my AI assistant. I kept designing these elegant architectures — hierarchical memory, cognitive engines, world models. And each time I'd get partway in, realize my assumptions were wrong, and want to try a different approach.
+
+But tearing out one memory design and replacing it with another was painful. Painful enough that I'd either stick with the wrong one too long or start from scratch and lose everything.
+
+Synthex exists because **I needed a way to iterate on memory architectures without it being a rewrite every time.**
+
+The pipeline is the experiment harness. The primitives are the building blocks I wished I had. Branching is literally "what if I tried a different prompt for summarization without blowing up what I already have."
+
+And the honest framing — *what do I actually know about how memory should work?* — is the entire thesis of the workbench approach. Nobody knows. The field doesn't know. Letta doesn't know, LangChain doesn't know, the research papers don't know. Everyone's guessing.
+
+The tool that wins is the one that makes it cheap to guess wrong and try again.
+
 ### 1.1 The Three Hypotheses
 
 Synthex is built on three core beliefs about agent memory:
