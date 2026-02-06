@@ -234,6 +234,25 @@ Where:
 - Late-arriving data → new input_fingerprint → gets processed
 - No `--full` flag needed for prompt changes
 
+#### 3.3.1 Canonical Fingerprinting Rules
+
+Every Record gets a `content_fingerprint` = SHA-256 hash over normalized content bytes (UTF-8, strip trailing whitespace).
+
+Per-step materialization key recipes:
+
+| Step Type | Materialization Key |
+|-----------|-------------------|
+| **transform** | `(branch, step_name, input_record_id, step_version_hash)` |
+| **aggregate** | `(branch, step_name, group_key, combined_input_fingerprint, step_version_hash)` |
+| **fold** | `(branch, step_name, sequence_fingerprint, step_version_hash)` |
+| **merge** | `(branch, step_name, dedupe_key, step_version_hash)` |
+
+Where:
+- `combined_input_fingerprint` = SHA-256 of concatenated input `content_fingerprint` values in **stable sort order** (sorted by content_fingerprint lexicographically)
+- `sequence_fingerprint` = SHA-256 of ordered list of input content_fingerprints (order determined by `meta.time.period` or explicit `order_key`)
+
+**Why different keys per step type:** Transform is 1:1 — the input record ID is stable and sufficient. Aggregates and folds take N inputs where the set/sequence can change — fingerprinting the combined inputs detects when group composition changes.
+
 ### 3.4 Reserved Metadata Keys
 
 ```python
@@ -276,14 +295,15 @@ The workhorse. Strictly one record in, one record out.
 
 Group records by a key (typically time period), reduce to one record.
 
+**Incremental semantics:** When a new record arrives for an already-aggregated period, the materialization key changes (new combined_input_fingerprint). The old aggregate for that period is **replaced** — only one aggregate per (branch, step, group_key) exists at a time. This is "last write wins": the most recent aggregation with the complete set of inputs is canonical.
+
+**Downstream impact:** If a monthly aggregate is replaced, downstream steps (e.g., fold) see a changed input fingerprint and re-process. For folds, this triggers the backfill behavior defined in section 3.8.
+
 #### Fold (N:1 sequential)
 
 Sequential processing with accumulated state. The key difference from aggregate: **order matters**, and each step sees previous state.
 
-**Open design questions (see Part X):**
-- Backfill behavior when inserting records in the middle
-- State growth and truncation strategy
-- Error recovery mid-fold
+See section 3.8 for the full fold contract including invalidation rules.
 
 #### Merge (N:N)
 
@@ -343,7 +363,47 @@ pipeline.output("context", from_="world-model", ...)
 pipeline.output("search", from_=["summaries", "monthly"], ...)
 ```
 
-### 3.7 Determinism and Audit
+### 3.8 Fold Contract and Invalidation Rules
+
+Fold is the most novel primitive. This section defines its exact behavior.
+
+**Ordering contract:**
+- Fold input is a **totally ordered list** by `meta.time.period` (or explicit `order_key` parameter)
+- The fold output is a function of the **entire sequence**, not incremental by default
+- `sequence_fingerprint = SHA-256(ordered list of input content_fingerprints)`
+
+**Invalidation behavior:**
+- Any change to any item in the sequence → sequence_fingerprint changes → cache miss → fold reruns
+- Insert in middle → sequence changes → full rerun from affected point
+
+**Checkpoint optimization (v1.0):**
+- Fold checkpoints every N steps (configurable, default: 6)
+- Each checkpoint stores: `prefix_fingerprint = SHA-256(first M items)`, accumulated state
+- On rerun, resume from nearest prior checkpoint whose prefix_fingerprint still matches
+- Example: Record inserted in month 8 of 28, checkpoint at month 6 still valid → rerun from month 7 only
+
+**State growth management:**
+- `max_state_tokens` parameter on fold (default: 8000)
+- When state exceeds limit, fold automatically summarizes state before passing to next iteration
+- Built-in compression, not user-configured
+
+**Error recovery:**
+- Checkpoint every N steps
+- On failure: resume from last valid checkpoint
+- If checkpoint corrupted (fingerprint mismatch): fall back to full rerun
+- Failure logged in run stats
+
+```python
+pipeline.fold("world-model",
+    from_="monthly",
+    prompt=world_model_prompt,
+    order_key="meta.time.period",      # explicit ordering
+    checkpoint_every=6,                 # checkpoint frequency
+    max_state_tokens=8000               # state size limit
+)
+```
+
+### 3.9 Determinism and Audit
 
 LLM calls are non-deterministic. We pick a lane: **audit determinism**.
 
@@ -396,7 +456,8 @@ pipeline.merge("unified", from_=["chatgpt", "claude"])
 
 pipeline.transform("transcripts",
     from_="unified",
-    prompt=extract_transcript
+    prompt=extract_transcript,
+    validate=None  # Optional: callable(Record) -> bool. Reserved for v1.0.
 )
 
 pipeline.transform("summaries",
@@ -421,7 +482,7 @@ pipeline.output("context",
     surface="projection"
 )
 
-pipeline.output("search",
+pipeline.output("memory-index",
     from_=["summaries", "monthly"],
     surface="search"
 )
@@ -429,7 +490,30 @@ pipeline.output("search",
 
 ### 4.3 Prompt Functions
 
-Prompts are Python functions, not template files:
+Prompts are Python functions, not template files.
+
+#### 4.3.1 Prompt Identity and Versioning
+
+Prompt functions need stable identity for materialization keys. Two approaches:
+
+**Default: Source hash**
+```python
+def summarize_conversation(record: Record) -> str:
+    ...
+# step_version_hash includes hash of inspect.getsource(summarize_conversation)
+```
+
+**Override: Explicit version** (for closures, generated functions, external state)
+```python
+@synthex.prompt(version="2026-02-05")
+def summarize_conversation(record: Record) -> str:
+    ...
+# step_version_hash uses explicit version string, ignores source
+```
+
+Source hash covers 90% of cases. Explicit version is the escape hatch when source hash is fragile.
+
+#### 4.3.2 Prompt Signatures
 
 ```python
 def summarize_conversation(record: Record) -> str:
@@ -477,6 +561,25 @@ New reflection ({record.metadata.get('period', 'unknown')}):
 
 ### 4.4 Execution
 
+#### 4.4.1 Pipeline Sync
+
+Before running, sync the pipeline definition to detect changes:
+
+```python
+pipeline.sync()
+# Pipeline 'personal-memory' — changes detected:
+#   CHANGED  summaries (prompt hash changed) → will reprocess 487 records
+#   CHANGED  monthly (upstream changed) → will reprocess 28 records
+#   CHANGED  world-model (upstream changed) → will reprocess 1 record
+#
+# Estimated cost: $1.68
+# Run with: pipeline.run()
+```
+
+`sync()` serializes the current pipeline definition (step graph + step_version_hashes), compares against stored definition, and shows what changed. This separates "define" from "execute" — same as `terraform plan` vs `terraform apply`.
+
+#### 4.4.2 Run Commands
+
 ```python
 # Run full pipeline
 pipeline.run()
@@ -495,6 +598,8 @@ plan = pipeline.plan()
 print(plan.steps)      # ['chatgpt', 'claude', 'unified', ...]
 print(plan.estimates)  # {'tokens': 1_200_000, 'cost': 1.50}
 ```
+
+**Parallelism (v1.0+):** v0.1 processes transforms sequentially. Parallel execution with rate limiting is a natural optimization — transforms are embarrassingly parallel. Deferred to post-MVP to keep execution engine simple.
 
 ### 4.5 Branching
 
@@ -525,17 +630,29 @@ if branch_score > main_score:
     branch.promote()  # merge to main
 ```
 
+**Promote semantics:**
+- `branch.promote()` performs **upsert by materialization_key** into main
+- Records and audit fields are copied/upserted
+- Run history remains branch-scoped (not merged)
+- If materialization_key exists on both branches with different content, promoted version wins
+- Downstream steps on main whose inputs changed are marked stale → re-process on next `pipeline.run()`
+
 ### 4.6 Querying
 
 ```python
 # Surface search — pick your altitude
 results = pipeline.search("Rust", step="monthly")
 
+# Unscoped search — highest-altitude dedup
+results = pipeline.search("Rust")
+# Searches all indexed steps. If monthly summary and source summary both match,
+# returns monthly (higher altitude). Lower-altitude hits available via drill-down.
+
 # Drill down — follow provenance
 for hit in results:
     print(hit.content)
-    print(hit.sources())        # conversation summaries
-    print(hit.leaves())         # raw transcripts
+    print(hit.sources())        # direct parents only (one hop up)
+    print(hit.leaves())         # deduplicated leaf records
 
 # Leaf search — straight to bottom
 raw = pipeline.search("FastAPI", step="transcripts", exact=True)
@@ -544,6 +661,15 @@ raw = pipeline.search("FastAPI", step="transcripts", exact=True)
 record = pipeline.get("record-uuid")
 lineage = record.lineage()      # tree of sources
 ```
+
+**Drill-down API contracts:**
+
+| Method | Returns | Parameters |
+|--------|---------|------------|
+| `sources()` | Direct parents only (one hop up the DAG) | None |
+| `leaves()` | Deduplicated leaf records (records with empty `sources[]`) | `max_depth=10`, `max_count=100` |
+
+"Leaf" = record with no sources = original source record. Breadth-first traversal with sensible limits to prevent explosion on ambiguous graphs.
 
 ### 4.7 The Hello World Experience
 
@@ -721,7 +847,7 @@ Use cases:
 A queryable index over one or more steps' records.
 
 ```python
-pipeline.output("search",
+pipeline.output("memory-index",
     from_=["summaries", "monthly"],
     surface="search"
 )
@@ -784,14 +910,36 @@ Full-text search at the bottom of the DAG.
 
 ## Part VII: Implementation Phases
 
-### Revised Phasing
+### Two Milestones: v0.1 vs v1.0
 
-Given the "experimentable memory" thesis, evaluation and branching move up:
+The doc previously conflated two different milestones under "v1." These have different audiences and scope.
 
-### Phase 1a: Foundation + Core Primitives (Week 1-2)
+| Milestone | Audience | Success Criteria |
+|-----------|----------|------------------|
+| **v0.1** | You (internal validation) | Does the DAG work on your own data? Is altitude search useful? |
+| **v1.0** | Other developers (public release) | Can someone else define a pipeline and get useful results? |
 
-**Goal:** Prove the DAG works with simpler primitives.
+---
 
+### v0.1: Internal Validation (Weeks 1-3)
+
+**Goal:** Prove the architecture on your own data.
+
+#### What ships in v0.1:
+
+| Area | In | Out |
+|------|-----|------|
+| **Primitives** | transform, aggregate | fold, merge |
+| **Incremental** | Materialization keys, content fingerprinting | Fold checkpoints |
+| **Pipeline** | `run()`, `plan()` | `sync()`, prompt versioning decorator |
+| **Search** | FTS with `step=` parameter | Unscoped search, drill-down API |
+| **Branching** | None (main only) | All branching |
+| **Security** | None | Everything |
+| **CLI** | `run`, `plan`, `search` | `serve`, `export` |
+
+#### v0.1 Phases:
+
+**Phase 1a: Foundation (Week 1-2)**
 - [ ] Project structure
   ```
   src/synthex/
@@ -804,8 +952,8 @@ Given the "experimentable memory" thesis, evaluation and branching move up:
   └── prompts.py       # Prompt utilities
   ```
 - [ ] Pipeline class with Python API
-- [ ] Step types: **transform, aggregate** (simpler primitives first)
-- [ ] Source importers: ChatGPT export
+- [ ] Step types: **transform, aggregate**
+- [ ] Source importer: Claude export
 - [ ] SQLite storage with materialization keys
 - [ ] Record creation with provenance
 - [ ] Run tracking and stats
@@ -813,27 +961,36 @@ Given the "experimentable memory" thesis, evaluation and branching move up:
 
 **Deliverable:** Can run `source → transform → aggregate` pipeline
 
-### Phase 1b: Advanced Primitives (Week 3-4)
+**Phase 1b: Search + Validation (Week 3)**
+- [ ] FTS5 search with `step=` parameter
+- [ ] `pipeline.plan()` with cost estimates
+- [ ] Manual inspection of outputs
 
-**Goal:** Add the harder primitives.
+**Deliverable:** v0.1 complete — architecture validated on your own data
 
-- [ ] **Fold** step with state management
-  - Checkpointing strategy
-  - Backfill behavior (see Part X open questions)
+#### What v0.1 proves:
+1. The DAG works — source → transform → aggregate produces correct outputs
+2. Incremental is real — re-run only processes new records
+3. Altitude search is useful — "monthly" results differ from "summary" results
+4. Cost model holds — predictions roughly match actuals
+
+---
+
+### v1.0: Public Release (Weeks 4-10)
+
+**Goal:** Ship to other developers.
+
+#### Additional v1.0 scope:
+
+**Phase 2: Advanced Primitives (Week 4-5)**
+- [ ] **Fold** step with checkpointing and state management
 - [ ] **Merge** step with deduplication
-  - content_hash dedup
-  - conflict resolution
-- [ ] Claude export importer
+- [ ] ChatGPT export importer
 - [ ] Multiple source support
-
-**Rationale:** Fold has three open design questions. Merge has dedup complexity. Better to prove DAG works first with transform/aggregate, then add complexity.
 
 **Deliverable:** Full four-primitive pipeline works
 
-### Phase 2: Eval Harness (Week 5-6)
-
-**Goal:** Prove you can measure architecture quality.
-
+**Phase 3: Eval Harness (Week 6-7)**
 - [ ] Benchmark runner framework
 - [ ] LoCoMo integration
 - [ ] LongMemEval integration
@@ -842,11 +999,9 @@ Given the "experimentable memory" thesis, evaluation and branching move up:
 - [ ] `synthex eval` command
 - [ ] Report generation
 
-**Rationale:** If the pitch is "find the right architecture through trial and error," then eval is load-bearing. The "just RAG with extra steps" critique gets answered by data.
+**Rationale:** If the pitch is "find the right architecture through trial and error," then eval is load-bearing.
 
 **Deliverable:** `synthex eval locomo --compare mem0` produces comparison table
-
-### Phase 3: Branching (Week 7-8)
 
 **Goal:** Prove you can cheaply compare architectures.
 
@@ -857,23 +1012,24 @@ Given the "experimentable memory" thesis, evaluation and branching move up:
 - [ ] Branch promote (merge to main via materialization keys)
 - [ ] Eval on branches
 
-**Rationale:** Branching enables the migration story — the sharpest differentiator. Cheap A/B comparison is what nobody else offers.
+**Rationale:** Branching enables the migration story — the sharpest differentiator.
 
 **Deliverable:** Can branch, modify prompts, run, compare eval scores, promote
 
-### Phase 4: Query + Polish (Week 9-10)
+**Phase 5: Query, Explorer + Polish (Week 10)**
 
-**Goal:** Complete the MVP experience.
+**Goal:** Complete the v1.0 experience.
 
-- [ ] DAG-aware search (surface, drill-down, leaf)
+- [ ] Unscoped search (highest-altitude dedup)
+- [ ] Drill-down API (`hit.sources()`, `hit.leaves()`)
 - [ ] Lineage visualization
-- [ ] Output surfaces (projection, search)
-- [ ] `synthex plan` with estimates
+- [ ] Pipeline Explorer (see Part XIII)
+- [ ] `synthex serve` for explorer UI
 - [ ] Hello World experience (`init --from`)
 - [ ] Error handling and progress bars
 - [ ] Documentation
 
-**Deliverable:** Complete MVP ready for users
+**Deliverable:** v1.0 complete — ready for other developers
 
 ---
 
@@ -951,6 +1107,12 @@ branch.transform("summaries",
     prompt=detailed_summary,  # different prompt
     model="gpt-4o"            # different model
 )
+
+# Always plan before running — especially on branches
+plan = branch.plan(full=True)
+# ⚠️  Warning: full reprocess on branch
+# Estimated cost: $24.50 (gpt-4o @ $2.50/1M in, $10/1M out)
+# This is 14x more expensive than main branch (gpt-4o-mini).
 
 branch.run(from_="summaries", full=True)
 
@@ -1050,49 +1212,26 @@ This is the killer differentiator. No existing benchmark touches this.
 
 ## Part X: Open Design Questions
 
-### 10.1 Fold Primitive Challenges
+### 10.1 Search Strategy
 
-Fold is the most novel and most dangerous primitive. Unresolved questions:
+**Decision: FTS-only for v0.1.**
 
-#### Backfill
+- SQLite FTS5 for text search
+- No similarity scores in v0.1 results
+- API includes `mode="fts"` parameter so interface is stable when semantic is added
+- Semantic search as pluggable addon in v1.0+ with clean boundary: optional sqlite-vss or external vector store, same query API, `mode="semantic"` or `mode="hybrid"`
+- Eval numbers in v0.1 use FTS retrieval, clearly labeled
 
-What happens when you insert a new month in the middle of the fold sequence?
+```python
+# v0.1 — FTS only
+results = pipeline.search("Rust", mode="fts")  # default
 
-Options:
-1. Re-run entire fold from insertion point (expensive)
-2. Mark downstream as stale, rebuild on next access (lazy)
-3. Require explicit `--full` for mid-sequence insertions
+# v1.0+ — semantic available
+results = pipeline.search("Rust", mode="semantic")
+results = pipeline.search("Rust", mode="hybrid")
+```
 
-#### State Growth
-
-The world model prompt passes `{{ state }}` which grows unboundedly.
-
-Options:
-1. Truncation strategy (keep last N tokens)
-2. Compression step (summarize state periodically)
-3. Sliding window (only last N inputs visible)
-
-#### Error Recovery
-
-If step 14 of 28 fails, what happens?
-
-Options:
-1. Checkpoint every N steps, resume from checkpoint
-2. Mark as failed, require manual intervention
-3. Retry with exponential backoff
-
-### 10.2 Semantic Search Strategy
-
-MVP says "SQLite for everything" but search results show similarity scores, implying semantic search. SQLite FTS is not semantic.
-
-**Decision needed:**
-- FTS only for v1 (simpler, but less useful)
-- sqlite-vss (finicky but possible)
-- Require external vector store (Postgres+pgvector, Pinecone)
-
-This cascades into whether eval numbers are meaningful.
-
-### 10.3 Error Model and Output Validation
+### 10.2 Error Model and Output Validation
 
 What happens when an LLM call returns garbage?
 
@@ -1135,28 +1274,35 @@ Bulk importing years of ChatGPT/Claude history means ingesting names, emails, me
 
 Provenance makes this *worse*: sensitive data isn't just stored, it's linked and traceable through lineage.
 
-### 11.2 Required Capabilities
+### 11.2 Capability Scope by Version
 
-#### PII Detection/Redaction
+| Capability | v0.1 | v1.0 | v1.5+ |
+|-----------|------|------|-------|
+| **Encryption at rest** | ❌ | Optional via SQLCipher (documented how-to) | ✓ |
+| **Cascade purge** | ❌ | ✓ (provenance makes it straightforward) | ✓ |
+| **PII detection** | ❌ | `pii="flag"` only — regex + optional Presidio | ✓ |
+| **PII redaction** | ❌ | ❌ | Full redaction with LLM-based detection |
+| **Field-level encryption** | ❌ | ❌ | ✓ |
 
-First-class primitive, not a user-defined transform.
+**v0.1 stance:** No security features. You're running on your own data locally. This is fine and honest.
+
+### 11.3 v1.0 Capabilities
+
+#### PII Detection (Flag Mode)
+
+First-class primitive, flag-only in v1.0.
 
 ```python
 pipeline.transform("transcripts",
     from_="chatgpt",
     prompt=extract_transcript,
-    pii="redact"  # or: "detect", "flag"
+    pii="flag"  # v1.0: flag only. v1.5+: "redact" available
 )
 ```
 
 #### Encryption at Rest
 
-SQLite with no encryption is a non-starter for enterprise.
-
-Options:
-- SQLCipher for SQLite encryption
-- Require Postgres for sensitive deployments
-- Field-level encryption for content
+SQLCipher for SQLite encryption — documented how-to, not built-in.
 
 #### Selective Purge (GDPR)
 
@@ -1171,7 +1317,7 @@ cascade = pipeline.purge("record-uuid", dry_run=True)
 print(cascade.affected_records)  # all downstream records
 ```
 
-### 11.3 Design Implications
+### 11.4 Design Implications
 
 Not v1-blocking, but data model must support:
 - Cascade deletion via provenance links
@@ -1195,6 +1341,65 @@ Key insights carried forward:
 - Refs/Branches → Branch model
 - Processors → Step types
 - Provenance tracking → Materialization keys + source links
+
+---
+
+## Part XIII: Pipeline Explorer
+
+The strongest novelty is altitude search + provenance drill-down. This should be the first demo — it's visceral. Search monthly reflections, click into source summaries, click into raw transcripts. The hierarchy becomes real.
+
+### 13.1 Explorer UI (v1.0)
+
+Lightweight web explorer served by `synthex serve`:
+
+**What it shows:**
+- Pipeline DAG visualization (steps as nodes, dependencies as edges)
+- Record browser by step (pick altitude, see records)
+- Search with step scoping (surface search)
+- **Drill-down view:** Click a record → see sources → click source → see its sources → down to leaves
+
+### 13.2 Three-Column Drill-Down
+
+```
+┌─────────────────────┬─────────────────────┬─────────────────────┐
+│  SEARCH RESULTS     │  SOURCES            │  DETAIL             │
+│  (monthly)          │  (summaries)        │  (transcript)       │
+├─────────────────────┼─────────────────────┼─────────────────────┤
+│                     │                     │                     │
+│ > March 2024        │ > Conv about Rust   │ User: I'm thinking  │
+│   Rust exploration  │   ownership model   │ about learning      │
+│   and systems...    │                     │ Rust...             │
+│                     │ > Conv about Python │                     │
+│   April 2024        │   vs Rust perf      │ Assistant: Great    │
+│   Backend arch...   │                     │ choice! The...      │
+│                     │ > Conv about...     │                     │
+│   May 2024          │                     │                     │
+│   ...               │                     │                     │
+│                     │                     │                     │
+└─────────────────────┴─────────────────────┴─────────────────────┘
+```
+
+Left column = search results at current altitude. Middle = selected record's sources. Right = selected source's content. Click through to navigate.
+
+### 13.3 Minimum Record Metadata for Explorer
+
+Every record needs enough metadata to render usefully:
+
+| Field | Required For |
+|-------|--------------|
+| `id` | Linking |
+| `content` (or truncated preview) | Display |
+| `step` | Altitude label |
+| `created_at` | Sorting |
+| `source_count` | "3 sources" indicator |
+| `meta.time.period` | For aggregates |
+| `meta.chat.conversation_id` | Grouping |
+
+### 13.4 Implementation Note
+
+Could be as simple as local FastAPI + htmx. The drill-down is the hard part visually — need to show hierarchy without overwhelming.
+
+**Phasing:** v1.0 feature, but the query API it depends on (`sources()`, `leaves()`, record metadata) must be designed during v0.1.
 
 ---
 
