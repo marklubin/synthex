@@ -69,30 +69,7 @@ The name "Synthex" comes from **synthesis** — the core action of transforming 
 
 ## Part II: Conceptual Grounding
 
-### 2.1 Naming Journey
-
-We explored terminology from multiple domains to find the right conceptual frame:
-
-#### Cognitive Science
-
-| Term | Origin | Relevance |
-|------|--------|-----------|
-| **Basal cognition** | Michael Levin | Cognition at cellular level, scale-free — memory primitives at any granularity |
-| **Merkwelt/Umwelt** | Jakob von Uexküll | Organism's perception-world — each agent has its own memory world |
-| **Enactive cognition** | Varela, Thompson, Rosch | Cognition through action/interaction — memory shapes future actions |
-
-#### Chip Design & Lithography
-
-| Term | Meaning | Our Equivalent |
-|------|---------|----------------|
-| **Schematic** | Circuit diagram | Pipeline definition |
-| **Synthesis** | HDL → gates | Pipeline → execution plan |
-| **Cell/Standard Cell** | Reusable primitives | Step types (transform, fold, etc.) |
-| **Fab/Foundry** | Where chips are made | The execution engine |
-
-**Key insight:** Agent memory architectures are like neural circuits — you wire together primitives into a schematic, synthesize it, and fab it.
-
-### 2.2 Design Inspirations
+### 2.1 Design Inspirations
 
 #### dbt (data build tool)
 
@@ -114,7 +91,7 @@ CloudFormation (YAML/JSON) came first, but CDK (imperative code that generates i
 - Copy-on-write semantics
 - Reproducible pipelines
 
-### 2.3 Competitive Landscape
+### 2.2 Competitive Landscape
 
 | Product | Approach | Strength | Weakness |
 |---------|----------|----------|----------|
@@ -132,7 +109,7 @@ We don't compete on simplicity (Mem0 wins) or temporal reasoning (Zep wins). We 
 - Change the architecture without losing data
 - Measure which architecture works best
 
-### 2.4 Red Team Critiques (Honest Assessment)
+### 2.3 Red Team Critiques (Honest Assessment)
 
 #### "Over-engineered" (Mem0's perspective)
 
@@ -152,7 +129,7 @@ We don't compete on simplicity (Mem0 wins) or temporal reasoning (Zep wins). We 
 
 **Counter:** The "extra steps" are the value. Summarization reduces noise, aggregation creates hierarchy, folding builds world models, provenance enables debugging. Raw RAG on 1,000 conversations is worse than hierarchical processed memory.
 
-### 2.5 Market Timing
+### 2.4 Market Timing
 
 The "no one has converged" window is real right now — the agent memory space is in active churn. But if the ecosystem converges on 2-3 standard patterns (like web dev converged on REST + Postgres), the workbench value shrinks.
 
@@ -310,9 +287,63 @@ Sequential processing with accumulated state. The key difference from aggregate:
 
 #### Merge (N:N)
 
-Combine records from multiple sources with deduplication.
+Combine records from multiple sources with deduplication. Merge sits at the top of most pipelines (unifying ChatGPT + Claude exports), so its semantics matter.
 
-### 3.6 Determinism and Audit
+**Deduplication strategy:**
+
+```python
+pipeline.merge("unified",
+    from_=["chatgpt", "claude"],
+    dedupe="content_hash",      # default: exact content match
+    # dedupe="metadata_match",  # match on specific fields
+    # dedupe="fuzzy",           # similarity threshold (future)
+    conflict="prefer_latest"    # or: prefer_first, keep_all
+)
+```
+
+Dedup options:
+- `content_hash` — SHA-256 of content. Exact duplicates only. Fast and safe.
+- `metadata_match` — Match on specified fields (e.g., `conversation_id`). For when same conversation appears in multiple exports with different formatting.
+- `fuzzy` (future) — Semantic similarity above threshold. Dangerous — requires careful tuning.
+
+Conflict resolution (when dedup matches):
+- `prefer_latest` — Keep record with most recent `meta.time.created_at`
+- `prefer_first` — Keep first record encountered (stable ordering)
+- `keep_all` — No dedup, emit all records (useful for debugging)
+
+**Open question:** Should merge require an LLM call (to reconcile conflicting versions) or stay purely mechanical? V1 keeps it mechanical — LLM-based reconciliation is a transform step the user can add downstream.
+
+### 3.6 The `from_` Parameter
+
+The `from_` parameter accepts either a string or list, with validity depending on step type:
+
+| Step Type | `from_` accepts | Rationale |
+|-----------|-----------------|-----------|
+| **transform** | string only | 1:1 mapping requires single source |
+| **aggregate** | string only | Groups records from one upstream step |
+| **fold** | string only | Sequential ordering requires single source |
+| **merge** | list only | Combining sources is the point |
+| **output** | string or list | Single step or union of multiple |
+
+```python
+# Transform — single source
+pipeline.transform("summaries", from_="transcripts", ...)
+
+# Aggregate — single source (groups by period within that source)
+pipeline.aggregate("monthly", from_="summaries", ...)
+
+# Fold — single source (ordering must be unambiguous)
+pipeline.fold("world-model", from_="monthly", ...)
+
+# Merge — list required
+pipeline.merge("unified", from_=["chatgpt", "claude"])
+
+# Output — either works
+pipeline.output("context", from_="world-model", ...)
+pipeline.output("search", from_=["summaries", "monthly"], ...)
+```
+
+### 3.7 Determinism and Audit
 
 LLM calls are non-deterministic. We pick a lane: **audit determinism**.
 
@@ -531,7 +562,55 @@ synthex search "that rust conversation"
 
 Behind the scenes, `synthex init --from` creates a sensible default pipeline.
 
-### 4.8 TOML as Export Format
+### 4.8 Cost Estimation
+
+For a pipeline processing 487 conversations through 5 steps, you're looking at real money. Users need to understand cost before they hit run.
+
+```python
+# Always plan before running
+plan = pipeline.plan()
+
+print(plan)
+# Pipeline: personal-memory
+# Branch: main
+#
+# Steps to execute:
+#   chatgpt      →    487 records (source)
+#   transcripts  →    487 records (transform, ~450 tok/rec)
+#   summaries    →    487 records (transform, ~800 tok/rec)
+#   monthly      →     28 records (aggregate, ~12k tok/rec)
+#   world-model  →      1 record  (fold, ~8k tok/rec)
+#
+# Estimated tokens: 1,247,000 input / 94,000 output
+# Estimated cost: $1.68 (gpt-4o-mini @ $0.15/1M in, $0.60/1M out)
+#
+# Run with: pipeline.run()
+
+# Access programmatically
+plan.total_input_tokens   # 1_247_000
+plan.total_output_tokens  # 94_000
+plan.estimated_cost       # 1.68
+plan.cost_by_step         # {'transcripts': 0.42, 'summaries': 0.89, ...}
+```
+
+**Branch cost warning:**
+
+```python
+branch = pipeline.branch("experiment")
+branch.transform("summaries", ..., model="gpt-4o")  # expensive model
+
+plan = branch.plan(full=True)
+# ⚠️  Warning: full reprocess on branch
+# Estimated cost: $24.50 (gpt-4o @ $2.50/1M in, $10/1M out)
+# This is 14x more expensive than main branch.
+```
+
+Cost estimation uses:
+- Record counts from previous runs (or source file analysis for new pipelines)
+- Average tokens per record by step type (calibrated from sample runs)
+- Current model pricing (updated in config)
+
+### 4.9 TOML as Export Format
 
 TOML isn't the primary interface, but pipelines can serialize for sharing:
 
@@ -648,6 +727,18 @@ pipeline.output("search",
 )
 ```
 
+**What gets indexed:**
+
+| Field | Indexed | Queryable | Notes |
+|-------|---------|-----------|-------|
+| `content` | FTS + embedding | text search, semantic search | Primary search target |
+| `step` | exact | filter | `step="monthly"` scopes to that level |
+| `meta.time.created_at` | range | filter, sort | Temporal queries |
+| `meta.time.period` | exact | filter | For aggregates: "2024-03" |
+| `meta.chat.conversation_id` | exact | filter | Group by conversation |
+
+The `step` field becomes a first-class facet — this is what enables surface search at different altitudes. When you call `pipeline.search("Rust", step="monthly")`, the step filter restricts results to records produced by the `monthly` step.
+
 ### 6.2 DAG-Aware Query Model
 
 The search system is DAG-aware, supporting three query modes:
@@ -697,9 +788,9 @@ Full-text search at the bottom of the DAG.
 
 Given the "experimentable memory" thesis, evaluation and branching move up:
 
-### Phase 1: Foundation + Processing Engine (Week 1-4)
+### Phase 1a: Foundation + Core Primitives (Week 1-2)
 
-**Goal:** Prove the primitives work.
+**Goal:** Prove the DAG works with simpler primitives.
 
 - [ ] Project structure
   ```
@@ -713,14 +804,31 @@ Given the "experimentable memory" thesis, evaluation and branching move up:
   └── prompts.py       # Prompt utilities
   ```
 - [ ] Pipeline class with Python API
-- [ ] Step types: transform, aggregate, fold, merge
-- [ ] Source importers: ChatGPT, Claude exports
+- [ ] Step types: **transform, aggregate** (simpler primitives first)
+- [ ] Source importers: ChatGPT export
 - [ ] SQLite storage with materialization keys
 - [ ] Record creation with provenance
 - [ ] Run tracking and stats
 - [ ] Basic CLI: init, run, status
 
-**Deliverable:** Can define pipeline in Python, run it, query results
+**Deliverable:** Can run `source → transform → aggregate` pipeline
+
+### Phase 1b: Advanced Primitives (Week 3-4)
+
+**Goal:** Add the harder primitives.
+
+- [ ] **Fold** step with state management
+  - Checkpointing strategy
+  - Backfill behavior (see Part X open questions)
+- [ ] **Merge** step with deduplication
+  - content_hash dedup
+  - conflict resolution
+- [ ] Claude export importer
+- [ ] Multiple source support
+
+**Rationale:** Fold has three open design questions. Merge has dedup complexity. Better to prove DAG works first with transform/aggregate, then add complexity.
+
+**Deliverable:** Full four-primitive pipeline works
 
 ### Phase 2: Eval Harness (Week 5-6)
 
@@ -888,6 +996,21 @@ Critical for the "evolving architecture" thesis: can the system distinguish yest
 
 Existing benchmarks test flat retrieval. They have no concept of hierarchical search or provenance. **Our most differentiating capability has no benchmark.**
 
+#### Why Not Extend Existing Benchmarks?
+
+The obvious question: "Can't you just add provenance questions to LoCoMo?"
+
+No — the test structure is fundamentally different.
+
+LoCoMo asks: "Retrieve fact X from the memory store." The evaluation is: did you find it?
+
+SynthexBench asks: "Retrieve fact X **at altitude Y**, then verify it traces to source Z." The evaluation is three-part:
+1. Did you find it at the requested abstraction level?
+2. Is the answer appropriate for that level (summary vs. detail)?
+3. Does the provenance chain correctly link to source records?
+
+This is a different evaluation shape. LoCoMo treats memory as a flat key-value store. SynthexBench treats memory as a DAG with meaningful structure. You can't bolt DAG-awareness onto a flat benchmark — you need questions designed around the hierarchy.
+
 #### What SynthexBench Tests
 
 **Multi-altitude retrieval:** Can the system find the right answer at different abstraction levels? Are answers appropriately different at summary vs. raw transcript level?
@@ -968,6 +1091,39 @@ MVP says "SQLite for everything" but search results show similarity scores, impl
 - Require external vector store (Postgres+pgvector, Pinecone)
 
 This cascades into whether eval numbers are meaningful.
+
+### 10.3 Error Model and Output Validation
+
+What happens when an LLM call returns garbage?
+
+**Failure modes:**
+- Transform produces unparseable output (e.g., summary that's just "I don't know")
+- Aggregate hallucinates facts not present in inputs
+- Fold state update contradicts previous state
+- Model returns refusal instead of content
+
+The audit trail captures what happened, but there's no validation or recovery.
+
+**Open questions:**
+
+#### Validation
+- Should transforms have optional validators? `pipeline.transform(..., validate=is_valid_summary)`
+- What's the failure behavior — skip record, retry, halt pipeline?
+- How do you validate "summarization quality" without another LLM call?
+
+#### Retry Policy
+- Exponential backoff for rate limits (obvious)
+- Retry on malformed output? How many times?
+- Different prompts on retry (e.g., add "You must provide a summary")?
+
+#### Quality Gates
+- Minimum content length?
+- Required fields in structured output?
+- Semantic similarity to input (anti-hallucination)?
+
+**V1 stance:** Minimal validation. Retry on API errors (rate limit, timeout). Log malformed outputs but don't halt. Quality gates are a v2 feature.
+
+The audit trail means you can always find bad outputs after the fact and reprocess. Perfect is the enemy of shipped.
 
 ---
 
